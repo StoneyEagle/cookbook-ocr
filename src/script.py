@@ -103,8 +103,13 @@ FRACTION_FIXUPS: list[tuple[re.Pattern, str]] = [
     # "Y=}" / "Y=}" with any trailing junk before unit → ¼ or ¼-½ range.
     (re.compile(rf"Y\s*=\s*\}}(?=\s*[-–]\s*[½1/]?\s*{_UNIT})", re.I), "¼"),
     (re.compile(rf"(?<!\w)Y[=\.]\s*(?=\s+{_UNIT})", re.I), "¼"),
-    # "Y." / "Y," standalone fraction-like → ¼.
-    (re.compile(rf"(?<!\w)Y[.,](?=\s+{_UNIT})", re.I), "¼"),
+    # "Y." / "Y," / "Y«" / "Y»" standalone fraction-like → ¼.
+    (re.compile(rf"(?<!\w)Y[.,«»<>]+(?=\s+{_UNIT})", re.I), "¼"),
+    # "1%:" / "1%," / "1%;" → 1½.
+    (re.compile(rf"(\d)%[:;,.]+(?=\s+{_UNIT})", re.I), r"\1½"),
+    # "2»" / "2«" at line start before a unit → ½ (mis-OCR of ½ glyph).
+    (re.compile(rf"(?m)^\s*2[»«](?=\s+{_UNIT})", re.I), "½"),
+    (re.compile(rf"(?m)^\s*1[»«](?=\s+{_UNIT})", re.I), "¼"),
 ]
 
 log = logging.getLogger("cookbook-ocr")
@@ -347,20 +352,37 @@ def best_ocr_layout_aware(
     columns = detect_column_ranges(bgr)
     log.debug("Detected %d column(s): %s", len(columns), columns)
     if len(columns) >= 2:
-        col_psms = (6, 4)
+        # Race both preprocessing modes per column. PSM 1 (auto+OSD) often
+        # picks up leading fraction glyphs that PSM 6 drops.
+        col_psms = (1, 6, 4)
         col_texts: list[str] = []
         col_confs: list[float] = []
+        # Pad each column generously so a fraction glyph or punctuation hugging
+        # the gutter edge isn't clipped off the leading or trailing character.
+        pad = max(40, int(bgr.shape[1] * 0.02))
+        max_x = bgr.shape[1]
         for x0, x1 in columns:
-            col_img = preprocess(bgr[:, x0:x1], src_dpi)
-            text, conf, _ = _race_psms(col_img, lang, extra_cfg, col_psms)
+            x0p = max(0, x0 - pad)
+            x1p = min(max_x, x1 + pad)
+            col_strip = bgr[:, x0p:x1p]
+            col_img = preprocess(col_strip, src_dpi)
+            col_aggr = preprocess(col_strip, src_dpi, aggressive=True)
+            t1, c1, _ = _race_psms(col_img, lang, extra_cfg, col_psms)
+            t2, c2, _ = _race_psms(col_aggr, lang, extra_cfg, col_psms)
+            if c2 > c1:
+                text, conf = t2, c2
+            else:
+                text, conf = t1, c1
             col_texts.append(text)
             col_confs.append(conf if conf > 0 else 0.0)
         multi_conf = float(np.mean(col_confs)) if col_confs else 0.0
         multi_text = "\n\n".join(t for t in col_texts if t.strip())
-        if multi_text.strip():
-            variants.append((multi_text, multi_conf, f"cols-{len(columns)}"))
+        # When multiple columns are detected, reading order matters more than
+        # marginal confidence — prefer columns unless they fail badly.
+        if multi_text.strip() and multi_conf >= 55:
+            return multi_text, multi_conf, f"cols-{len(columns)}"
 
-    # Pick the variant with highest confidence; tie-break on character count.
+    # Single-column page (or column mode failed): pick best of full/hard.
     variants.sort(key=lambda v: (v[1], len(v[0])), reverse=True)
     return variants[0]
 
@@ -539,8 +561,10 @@ def clean_text(raw: str) -> str:
             continue
         prev = raw_lines[i - 1].strip() if i > 0 else ""
         nxt = raw_lines[i + 1].strip() if i + 1 < len(raw_lines) else ""
-        if _is_likely_heading(stripped, prev, nxt):
-            # Headings stand alone — no trailing hard break, blank line before.
+        # Skip heading candidate if everything after it on the page is blank —
+        # that's a page-footer (book title, page number) rather than a title.
+        rest_blank = not any(raw_lines[j].strip() for j in range(i + 1, len(raw_lines)))
+        if _is_likely_heading(stripped, prev, nxt) and not rest_blank:
             if out_lines and out_lines[-1] != "":
                 out_lines.append("")
             out_lines.append(f"## {stripped}")
