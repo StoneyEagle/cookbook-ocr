@@ -21,3 +21,6 @@ Thumbs.db
 # OCR inputs (copyright — do not redistribute) and derived outputs
 input/*.pdf
 output/
+
+# Tesseract language data (download via instructions in README)
+tessdata_best/

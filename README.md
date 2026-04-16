@@ -8,10 +8,12 @@ Accuracy-first OCR pipeline for digitizing old cookbooks. Converts scanned PDFs 
 2. **Auto-rotate** via Tesseract OSD (fixes sideways / upside-down scans)
 3. **Preprocess** with OpenCV — CLAHE for uneven lighting, non-local means denoise, deskew, adaptive threshold
 4. **Upscale** to ≥320 effective DPI for small serif type
-5. **OCR** with Tesseract, racing PSM 3 vs PSM 4, pick by mean word confidence
-6. **Reconstruct** reading order from `image_to_data` blocks/paragraphs
-7. **Clean** Unicode — ligatures (`fi`, `fl`, `ffi`), smart quotes, hyphenated line-wrap joining
-8. Write per-PDF Markdown with page headings
+5. **Layout detection** — vertical-projection column finder; per-column OCR when multi-column is detected, full-page otherwise
+6. **OCR** with Tesseract, racing PSM 1 / 3 / 4 / 6, pick by mean word confidence
+7. **Reconstruct** reading order from `image_to_data` blocks/paragraphs
+8. **Garbage filter** — `wordfreq`-backed plausibility check drops ornamental borders (`BEANE NRA RENE NERA`, `Ho HE`, etc.)
+9. **Clean** — ligatures (`fi`, `fl`, `ffi`), smart quotes, hyphenated line-wrap joining, Unicode fraction normalization (`1/2` → `½`, `¥%` → `½`)
+10. Write per-PDF Markdown with markdown hard line breaks preserving ingredient layout
 
 ## Layout
 
@@ -32,7 +34,15 @@ python -m venv .venv
 
 Install Tesseract separately: <https://github.com/UB-Mannheim/tesseract/wiki>.
 
-For best accuracy, grab `eng.traineddata` from [`tessdata_best`](https://github.com/tesseract-ocr/tessdata_best) and pass `--tessdata /path/to/tessdata_best`.
+Download [`tessdata_best`](https://github.com/tesseract-ocr/tessdata_best) models (LSTM float-precision; higher accuracy than the int-quantized models bundled with Tesseract):
+
+```bash
+mkdir tessdata_best
+curl -L -o tessdata_best/eng.traineddata https://github.com/tesseract-ocr/tessdata_best/raw/main/eng.traineddata
+curl -L -o tessdata_best/osd.traineddata https://github.com/tesseract-ocr/tessdata_best/raw/main/osd.traineddata
+```
+
+The script auto-detects a `tessdata_best/` directory at project root.
 
 ## Run
 

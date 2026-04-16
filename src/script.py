@@ -30,6 +30,7 @@ import fitz  # PyMuPDF
 import numpy as np
 import pytesseract
 from PIL import Image
+from wordfreq import zipf_frequency
 
 # Windows: auto-detect standard Tesseract install.
 DEFAULT_TESSERACT = r"C:\Program Files\Tesseract-OCR\tesseract.exe"
@@ -40,13 +41,18 @@ SCRIPT_DIR = Path(__file__).resolve().parent
 PROJECT_DIR = SCRIPT_DIR.parent
 INPUT_DIR = PROJECT_DIR / "input"
 OUTPUT_DIR = PROJECT_DIR / "output"
+# Auto-detect tessdata_best at project root. Much higher accuracy than the
+# default "fast" model shipped with UB-Mannheim, especially for fractions
+# and small serif type common in cookbooks.
+LOCAL_TESSDATA_BEST = PROJECT_DIR / "tessdata_best"
 
 RENDER_DPI = 400                      # high DPI for small serif in old cookbooks
 MIN_EFFECTIVE_DPI = 320               # upscale below this
 TESS_LANG = "eng"
 TESS_OEM = 1                          # LSTM only
-# Page segmentation modes to race. 3 = fully automatic; 4 = single column variable sizes.
-TESS_PSM_CANDIDATES = (3, 4)
+# Page segmentation modes to race. 1 = auto with OSD, 3 = auto, 4 = single
+# column variable sizes, 6 = uniform block of text (wins for dense body copy).
+TESS_PSM_CANDIDATES = (1, 3, 4, 6)
 
 LIGATURE_MAP = {
     "\ufb00": "ff", "\ufb01": "fi", "\ufb02": "fl",
@@ -55,6 +61,43 @@ LIGATURE_MAP = {
     "\u2018": "'", "\u2019": "'", "\u201c": '"', "\u201d": '"',
     "\u00a0": " ",
 }
+
+# Common Tesseract misreads for vulgar fractions. Fired only when the token
+# is adjacent to a measurement context (digit before, or unit word after) to
+# avoid corrupting real text. Patterns tuned against observed output.
+_UNIT = r"(?:cup|tsp|tbsp|teaspoon|tablespoon|pound|oz|lb|quart|pint|gallon|cloves?|stick)"
+
+FRACTION_FIXUPS: list[tuple[re.Pattern, str]] = [
+    # Bare "¥%", "¥/" — yen/percent combo that Tesseract emits for ½.
+    (re.compile(r"¥\s*[%/]"), "½"),
+    # "Ys" followed by a unit → ¼ (stylized ¼ glyph rendered as Ys).
+    (re.compile(rf"\bYs\b(?=\s+{_UNIT})", re.I), "¼"),
+    # "'/«", "'/<", "'/.", "'/," → ¼ (fancy ¼ glyph).
+    (re.compile(r"['`]\s*[/\\]\s*[«<.,]"), "¼"),
+    # Leading "%." at start of a measurement → ¼.
+    (re.compile(rf"(?m)^\s*%\.(?=\s+{_UNIT})", re.I), "¼"),
+    # Leading "%" at start of a measurement → ½.
+    (re.compile(rf"(?m)^\s*%(?=\s+{_UNIT})", re.I), "½"),
+    # "\d½\d" (stuck digit after recognized ½) → drop trailing digit.
+    (re.compile(r"(\d½)\d\b"), r"\1"),
+    # "1'%", "1'/", etc. → "1½".
+    (re.compile(r"(\d)['`]?\s*[%/][.,]?(?=\s)"), r"\1½"),
+    # "4%" before a unit → ¼.
+    (re.compile(rf"(?<!\d)4%(?=\s+{_UNIT})", re.I), "¼"),
+    # "%" between digit and unit ("2% cup") → ½.
+    (re.compile(rf"(?<=\s)%(?=\s+{_UNIT})", re.I), "½"),
+    # ASCII fractions adjacent to measurement units → Unicode vulgar fractions.
+    (re.compile(rf"\b1/2\b(?=\s+{_UNIT})", re.I), "½"),
+    (re.compile(rf"\b1/4\b(?=\s+{_UNIT})", re.I), "¼"),
+    (re.compile(rf"\b3/4\b(?=\s+{_UNIT})", re.I), "¾"),
+    (re.compile(rf"\b1/3\b(?=\s+{_UNIT})", re.I), "⅓"),
+    (re.compile(rf"\b2/3\b(?=\s+{_UNIT})", re.I), "⅔"),
+    (re.compile(rf"\b1/8\b(?=\s+{_UNIT})", re.I), "⅛"),
+    # Composite "\d 1/2" → "\d½" (e.g. "1 1/2 cups").
+    (re.compile(rf"(\d)\s+1/2(?=\s+{_UNIT})", re.I), r"\1½"),
+    (re.compile(rf"(\d)\s+1/4(?=\s+{_UNIT})", re.I), r"\1¼"),
+    (re.compile(rf"(\d)\s+3/4(?=\s+{_UNIT})", re.I), r"\1¾"),
+]
 
 log = logging.getLogger("cookbook-ocr")
 
@@ -140,6 +183,57 @@ def preprocess(bgr: np.ndarray, src_dpi: int) -> Image.Image:
     return Image.fromarray(binarized)
 
 
+def detect_column_ranges(bgr: np.ndarray) -> list[tuple[int, int]]:
+    """
+    Detect text columns from vertical projection of the page.
+    Returns a list of (x_start, x_end). Single entry = no split needed.
+    """
+    gray = cv2.cvtColor(bgr, cv2.COLOR_BGR2GRAY) if bgr.ndim == 3 else bgr
+    h, w = gray.shape
+    # Binary inverse: ink = 255, paper = 0.
+    _, bw = cv2.threshold(gray, 0, 255, cv2.THRESH_BINARY_INV | cv2.THRESH_OTSU)
+    # Ignore horizontal decorative rules: remove very long horizontal ink runs
+    # so they don't dominate the projection.
+    horiz_kernel = cv2.getStructuringElement(cv2.MORPH_RECT, (max(40, w // 30), 1))
+    horiz_lines = cv2.morphologyEx(bw, cv2.MORPH_OPEN, horiz_kernel)
+    bw = cv2.subtract(bw, horiz_lines)
+
+    col_ink = bw.sum(axis=0) / 255.0
+    # Smooth to wash out word gaps.
+    k = max(5, w // 200)
+    smoothed = np.convolve(col_ink, np.ones(k) / k, mode="same")
+    empty = smoothed < (h * 0.01)
+
+    nonempty = np.where(~empty)[0]
+    if nonempty.size == 0:
+        return [(0, w)]
+    left_edge, right_edge = int(nonempty[0]), int(nonempty[-1]) + 1
+
+    # Find internal gutters (wide runs of empty columns, not touching edges).
+    min_gutter = max(20, int(w * 0.02))
+    gutters: list[tuple[int, int]] = []
+    i = left_edge
+    while i < right_edge:
+        if empty[i]:
+            j = i
+            while j < right_edge and empty[j]:
+                j += 1
+            if j - i >= min_gutter:
+                gutters.append((i, j))
+            i = j
+        else:
+            i += 1
+
+    if not gutters:
+        return [(left_edge, right_edge)]
+
+    cuts = [left_edge] + [(gs + ge) // 2 for gs, ge in gutters] + [right_edge]
+    min_col = max(120, int(w * 0.15))
+    cols = [(cuts[i], cuts[i + 1]) for i in range(len(cuts) - 1)
+            if cuts[i + 1] - cuts[i] >= min_col]
+    return cols or [(left_edge, right_edge)]
+
+
 # ---------- OCR ----------
 
 def ocr_with_confidence(img: Image.Image, psm: int, lang: str, extra_cfg: str) -> tuple[str, float]:
@@ -168,22 +262,129 @@ def ocr_with_confidence(img: Image.Image, psm: int, lang: str, extra_cfg: str) -
     return "\n".join(ordered), mean_conf
 
 
-def best_ocr(img: Image.Image, lang: str, extra_cfg: str) -> tuple[str, float, int]:
+def _race_psms(img: Image.Image, lang: str, extra_cfg: str, psms: tuple[int, ...]) -> tuple[str, float, int]:
     best: tuple[str, float, int] = ("", -1.0, -1)
-    for psm in TESS_PSM_CANDIDATES:
+    for psm in psms:
         try:
             text, conf = ocr_with_confidence(img, psm, lang, extra_cfg)
         except pytesseract.TesseractError as e:
             log.debug("PSM %d failed: %s", psm, e)
             continue
-        # Prefer higher confidence; break ties by more text.
         score = conf + (len(text) / 1e6)
         if score > best[1] + (len(best[0]) / 1e6):
             best = (text, conf, psm)
     return best
 
 
+def best_ocr(img: Image.Image, lang: str, extra_cfg: str) -> tuple[str, float, int]:
+    return _race_psms(img, lang, extra_cfg, TESS_PSM_CANDIDATES)
+
+
+def best_ocr_layout_aware(
+    bgr: np.ndarray, src_dpi: int, lang: str, extra_cfg: str
+) -> tuple[str, float, str]:
+    """
+    Detect columns and pick the higher-confidence of full-page vs per-column OCR.
+    Returns (text, conf, mode_label).
+    """
+    full_img = preprocess(bgr, src_dpi)
+    full_text, full_conf, full_psm = best_ocr(full_img, lang, extra_cfg)
+
+    columns = detect_column_ranges(bgr)
+    if len(columns) < 2:
+        return full_text, full_conf, f"full/psm{full_psm}"
+
+    # PSM 6 = uniform text block; PSM 4 = single column variable sizes.
+    col_psms = (6, 4)
+    col_texts: list[str] = []
+    col_confs: list[float] = []
+    for x0, x1 in columns:
+        col_img = preprocess(bgr[:, x0:x1], src_dpi)
+        text, conf, _ = _race_psms(col_img, lang, extra_cfg, col_psms)
+        col_texts.append(text)
+        col_confs.append(conf if conf > 0 else 0.0)
+
+    multi_conf = float(np.mean(col_confs)) if col_confs else 0.0
+    multi_text = "\n\n".join(t for t in col_texts if t.strip())
+
+    if multi_conf > full_conf + 1.5:  # bias toward full-page unless clearly better
+        return multi_text, multi_conf, f"cols-{len(columns)}"
+    return full_text, full_conf, f"full/psm{full_psm}"
+
+
 # ---------- cleanup ----------
+
+_RECIPE_HEADER_WORDS = {
+    "ingredients", "directions", "instructions", "method", "notes", "serves",
+    "yield", "prep", "cook", "total", "serving", "servings", "makes",
+}
+
+# Cookbook terms that are real English but have low corpus frequency.
+_COOKBOOK_ALLOW = {
+    "tahini", "gochujang", "harissa", "miso", "dashi", "mirin", "shoyu",
+    "za'atar", "sumac", "urfa", "aleppo", "chipotle", "ancho", "guajillo",
+    "saffron", "cardamom", "fennel", "coriander", "sumac", "pomegranate",
+    "scampi", "quinoa", "couscous", "bulgur", "freekeh", "farro",
+}
+
+
+def _looks_like_word(token: str) -> bool:
+    """Plausible-English-word check using wordfreq + structural rules."""
+    t = token.lower().strip(".,!?;:'\"()[]{}/\\")
+    if len(t) < 2:
+        return False
+    if any(ch.isdigit() for ch in t):
+        return True  # numbers and measurements always count
+    if t in _COOKBOOK_ALLOW or t in _RECIPE_HEADER_WORDS:
+        return True
+    if not any(c in "aeiouy" for c in t):
+        return False
+    if re.search(r"[bcdfghjklmnpqrstvwxz]{4,}", t):
+        return False
+    # wordfreq zipf: 7=ultra-common, 3=moderate, 2=rare but real, 0=unknown.
+    return zipf_frequency(t, "en") >= 2.0
+
+
+def _is_garbage_line(line: str) -> bool:
+    """Detect decorative borders / OCR noise from ornaments."""
+    stripped = line.strip().rstrip(" ")
+    if not stripped:
+        return False
+    letters = sum(ch.isalpha() for ch in stripped)
+    total = len(stripped)
+    if total <= 2 and letters <= 1:
+        return True
+    if total >= 6 and letters / total < 0.35:
+        return True
+
+    tokens = stripped.split()
+    word_tokens = [t for t in tokens if _looks_like_word(t)]
+    bare_tokens = [t.strip(".,!?;:'\"()[]{}") for t in tokens]
+
+    # Very short lines with no digit = isolated ornament debris ("Ho HE", "a uA").
+    # Digits protect legit ingredient starts ("1 tsp", "4 oz").
+    if total < 7 and not any(ch.isdigit() for ch in stripped):
+        return True
+    # Short lines where no token is a plausible word.
+    if len(tokens) <= 4 and total < 30 and not word_tokens:
+        return True
+    # Isolated single-word lines that are all-caps and not known headers.
+    if len(tokens) == 1:
+        bare = bare_tokens[0]
+        if bare.isupper() and len(bare) <= 8 and bare.lower() not in _RECIPE_HEADER_WORDS:
+            if zipf_frequency(bare.lower(), "en") < 3.5:
+                return True
+    # Short all-caps lines where no token is a common English word → ornament.
+    # "BEANE NRA RENE NERA", "EEE HEHE", etc.
+    if total < 35 and all(t.isupper() and len(t) >= 2 for t in bare_tokens if t):
+        common = [t for t in bare_tokens if zipf_frequency(t.lower(), "en") >= 4.0]
+        if len(common) < max(1, len(bare_tokens) // 2):
+            return True
+    # Runs of short tokens with <40% recognizable.
+    if len(tokens) >= 2 and len(word_tokens) / max(1, len(tokens)) < 0.4:
+        return True
+    return False
+
 
 def clean_text(raw: str) -> str:
     text = unicodedata.normalize("NFKC", raw)
@@ -207,11 +408,23 @@ def clean_text(raw: str) -> str:
         else:
             merged.append(ln)
             i += 1
-    text = "\n".join(merged)
+
+    filtered = [ln for ln in merged if not _is_garbage_line(ln)]
+    text = "\n".join(filtered)
+
+    for pattern, repl in FRACTION_FIXUPS:
+        text = pattern.sub(repl, text)
+
     text = re.sub(r"[ \t]+", " ", text)
     text = re.sub(r"\n{3,}", "\n\n", text)
-    text = "\n".join(ln.rstrip() for ln in text.splitlines())
-    return text.strip()
+    # Preserve source line breaks in rendered markdown. Single "\n" renders as
+    # a space, which destroys ingredient lists — append two trailing spaces to
+    # every non-empty line so markdown treats them as hard line breaks.
+    out_lines: list[str] = []
+    for ln in text.splitlines():
+        stripped = ln.rstrip()
+        out_lines.append(stripped + "  " if stripped else "")
+    return "\n".join(out_lines).strip()
 
 
 # ---------- driver ----------
@@ -234,10 +447,9 @@ def ocr_pdf(pdf_path: Path, out_path: Path, dpi: int, lang: str, extra_cfg: str)
         for i, page in enumerate(doc, start=1):
             bgr = render_page(page, dpi)
             bgr = correct_orientation(bgr)
-            pil = preprocess(bgr, dpi)
-            text, conf, psm = best_ocr(pil, lang, extra_cfg)
+            text, conf, mode = best_ocr_layout_aware(bgr, dpi, lang, extra_cfg)
             cleaned = clean_text(text)
-            log.info("  page %3d/%d  conf=%.1f  psm=%d  chars=%d", i, total, conf, psm, len(cleaned))
+            log.info("  page %3d/%d  conf=%.1f  mode=%s  chars=%d", i, total, conf, mode, len(cleaned))
             f.write(f"\n## Page {i}\n\n")
             if cleaned:
                 f.write(cleaned)
@@ -282,11 +494,21 @@ def main() -> int:
         pytesseract.pytesseract.tesseract_cmd = str(args.tesseract)
 
     extra_cfg = ""
-    if args.tessdata:
-        if not args.tessdata.exists():
-            raise SystemExit(f"tessdata path not found: {args.tessdata}")
-        os.environ["TESSDATA_PREFIX"] = str(args.tessdata)
-        extra_cfg = f'--tessdata-dir "{args.tessdata}"'
+    tessdata = args.tessdata
+    if tessdata is None and LOCAL_TESSDATA_BEST.exists():
+        tessdata = LOCAL_TESSDATA_BEST
+        log.info("Using local tessdata_best at %s", tessdata)
+    if tessdata:
+        if not tessdata.exists():
+            raise SystemExit(f"tessdata path not found: {tessdata}")
+        tessdata_abs = tessdata.resolve()
+        if " " in str(tessdata_abs):
+            raise SystemExit(
+                "tessdata path contains spaces; move it to a space-free location "
+                "(pytesseract config parsing cannot handle quoted paths)."
+            )
+        os.environ["TESSDATA_PREFIX"] = str(tessdata_abs)
+        extra_cfg = f"--tessdata-dir {tessdata_abs}"
 
     check_tesseract()
 
