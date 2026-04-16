@@ -408,8 +408,8 @@ def _looks_like_word(token: str) -> bool:
     t = token.lower().strip(".,!?;:'\"()[]{}/\\")
     if len(t) < 2:
         return False
-    if any(ch.isdigit() for ch in t):
-        return True  # numbers and measurements always count
+    if any(ch.isdigit() or ch.isnumeric() for ch in t):
+        return True  # numbers, fractions, and measurements always count
     if t in _COOKBOOK_ALLOW or t in _RECIPE_HEADER_WORDS:
         return True
     if not any(c in "aeiouy" for c in t):
@@ -421,6 +421,11 @@ def _looks_like_word(token: str) -> bool:
 
 
 _SINGLE_CHAR_WORDS = {"a", "i", "o", "&", "+"}
+
+
+def _has_numeric(token: str) -> bool:
+    """Treats digits and vulgar fractions (½, ¼, etc.) as numeric content."""
+    return any(ch.isdigit() or ch.isnumeric() for ch in token)
 
 
 def _strip_line_suffix_junk(line: str) -> str:
@@ -436,7 +441,7 @@ def _strip_line_suffix_junk(line: str) -> str:
             continue
         if bare.lower() in _SINGLE_CHAR_WORDS:
             break
-        if _looks_like_word(bare) or any(ch.isdigit() for ch in bare):
+        if _looks_like_word(bare) or _has_numeric(bare):
             break
         if len(bare) <= 2:
             drop += 1
@@ -460,7 +465,7 @@ def _strip_line_prefix_junk(line: str) -> str:
             continue
         if bare.lower() in _SINGLE_CHAR_WORDS:
             break
-        if _looks_like_word(bare) or any(ch.isdigit() for ch in bare):
+        if _looks_like_word(bare) or _has_numeric(bare):
             break
         if len(bare) <= 2:  # "Co", "Ho" and similar short non-words
             drop += 1
@@ -513,7 +518,10 @@ def _is_garbage_line(line: str) -> bool:
 
 
 def clean_text(raw: str) -> str:
-    text = unicodedata.normalize("NFKC", raw)
+    # NFC (not NFKC): NFKC's compatibility decomposition breaks vulgar
+    # fraction glyphs like "½" into "1⁄2" (fraction slash), undoing the
+    # fraction normalization that the Surya engine does upstream.
+    text = unicodedata.normalize("NFC", raw)
     for src, dst in LIGATURE_MAP.items():
         text = text.replace(src, dst)
 
@@ -635,7 +643,15 @@ def _is_likely_heading(line: str, prev: str, nxt: str) -> bool:
 
 # ---------- driver ----------
 
-def ocr_pdf(pdf_path: Path, out_path: Path, dpi: int, lang: str, extra_cfg: str) -> None:
+def ocr_pdf(
+    pdf_path: Path,
+    out_path: Path,
+    dpi: int,
+    lang: str,
+    extra_cfg: str,
+    engine_name: str = "tesseract",
+    surya_engine=None,
+) -> None:
     log.info("Processing %s", pdf_path.name)
     doc = fitz.open(pdf_path)
     total = doc.page_count
@@ -643,7 +659,7 @@ def ocr_pdf(pdf_path: Path, out_path: Path, dpi: int, lang: str, extra_cfg: str)
     header = [
         f"# {pdf_path.stem}",
         "",
-        f"*OCR transcription of `{pdf_path.name}` ({total} pages). Engine: Tesseract + OpenCV.*",
+        f"*OCR transcription of `{pdf_path.name}` ({total} pages). Engine: {engine_name}.*",
         "",
         "---",
         "",
@@ -653,8 +669,15 @@ def ocr_pdf(pdf_path: Path, out_path: Path, dpi: int, lang: str, extra_cfg: str)
         for i, page in enumerate(doc, start=1):
             bgr = render_page(page, dpi)
             bgr = correct_orientation(bgr)
-            text, conf, mode = best_ocr_layout_aware(bgr, dpi, lang, extra_cfg)
-            cleaned = clean_text(text)
+            if engine_name == "surya" and surya_engine is not None:
+                from surya_engine import assemble_markdown
+                lines, conf = surya_engine.ocr_page(bgr)
+                raw = assemble_markdown(lines, page_width=bgr.shape[1])
+                mode = f"surya/{len(lines)}lines"
+                cleaned = clean_text(raw)
+            else:
+                text, conf, mode = best_ocr_layout_aware(bgr, dpi, lang, extra_cfg)
+                cleaned = clean_text(text)
             log.info("  page %3d/%d  conf=%.1f  mode=%s  chars=%d", i, total, conf, mode, len(cleaned))
             f.write(f"\n## Page {i}\n\n")
             if cleaned:
@@ -687,6 +710,12 @@ def main() -> int:
     parser.add_argument("--tessdata", type=Path, default=None, help="Override TESSDATA_PREFIX (e.g. tessdata_best).")
     parser.add_argument("--tesseract", type=Path, default=None, help="Path to tesseract.exe.")
     parser.add_argument("--force", action="store_true", help="Re-OCR even if markdown exists.")
+    parser.add_argument(
+        "--engine",
+        choices=("tesseract", "surya"),
+        default="surya",
+        help="OCR engine. Surya is transformer-based, higher accuracy, slower.",
+    )
     parser.add_argument("-v", "--verbose", action="store_true")
     args = parser.parse_args()
 
@@ -721,7 +750,12 @@ def main() -> int:
         if user_words.exists() and " " not in str(user_words):
             extra_cfg += f" --user-words {user_words}"
 
-    check_tesseract()
+    surya_engine = None
+    if args.engine == "surya":
+        from surya_engine import SuryaEngine
+        surya_engine = SuryaEngine()
+    else:
+        check_tesseract()
 
     args.out.mkdir(parents=True, exist_ok=True)
     pdfs = sorted(args.src.glob("*.pdf"))
@@ -734,7 +768,7 @@ def main() -> int:
         if md.exists() and not args.force:
             log.info("Skipping %s (exists; --force to re-run)", md.name)
             continue
-        ocr_pdf(pdf, md, args.dpi, args.lang, extra_cfg)
+        ocr_pdf(pdf, md, args.dpi, args.lang, extra_cfg, args.engine, surya_engine)
 
     return 0
 

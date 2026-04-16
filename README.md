@@ -4,16 +4,32 @@ Accuracy-first OCR pipeline for digitizing old cookbooks. Converts scanned PDFs 
 
 ## Pipeline
 
+Two OCR engines are supported. Default is **Surya** — a transformer-based
+document OCR that performs text detection, recognition, and reading-order
+analysis in a single pass.
+
+### Surya path (default, `--engine surya`)
+
 1. **Rasterize** PDF pages at 400 DPI with PyMuPDF
-2. **Auto-rotate** via Tesseract OSD (fixes sideways / upside-down scans)
-3. **Preprocess** with OpenCV — CLAHE for uneven lighting, non-local means denoise, deskew, adaptive threshold
-4. **Upscale** to ≥320 effective DPI for small serif type
-5. **Layout detection** — vertical-projection column finder; per-column OCR when multi-column is detected, full-page otherwise
-6. **OCR** with Tesseract, racing PSM 1 / 3 / 4 / 6, pick by mean word confidence
-7. **Reconstruct** reading order from `image_to_data` blocks/paragraphs
-8. **Garbage filter** — `wordfreq`-backed plausibility check drops ornamental borders (`BEANE NRA RENE NERA`, `Ho HE`, etc.)
-9. **Clean** — ligatures (`fi`, `fl`, `ffi`), smart quotes, hyphenated line-wrap joining, Unicode fraction normalization (`1/2` → `½`, `¥%` → `½`)
-10. Write per-PDF Markdown with markdown hard line breaks preserving ingredient layout
+2. **Auto-rotate** via Tesseract OSD
+3. Run Surya detection + recognition → returns per-line bboxes, text, confidence
+4. **Column clustering** — split bboxes into banner lines (page-wide) and
+   column lines (clustered by x-start), emit each section in top-down order
+5. **Fraction normalization** — `11⁄2` → `½`, `23/4` → `¾`, LaTeX `\frac{1}{2}`
+   → `½`
+6. Preserve inline formatting — `<b>` → `**bold**`, `<i>` → `*italic*`
+
+### Tesseract path (`--engine tesseract`)
+
+1. Rasterize at 400 DPI
+2. Auto-rotate via OSD
+3. Preprocess — CLAHE, denoise, deskew, upscale, adaptive threshold
+4. **Layout variants race**: full-page adaptive, full-page hard-threshold
+   (kills illustration bleed-through), per-column (when 2+ columns detected)
+5. OCR each variant with a PSM race (1/3/4/6), pick highest mean word confidence
+6. `wordfreq` garbage filter drops ornamental borders
+7. Line prefix/suffix strip removes margin-rule debris
+8. Fraction and ligature normalization
 
 ## Layout
 
@@ -50,16 +66,19 @@ The script auto-detects a `tessdata_best/` directory at project root.
 .venv/Scripts/python.exe src/script.py -v
 ```
 
+First Surya run downloads ~1.5GB of model weights to a user cache. Subsequent runs reuse them.
+
 Flags:
 
 | Flag | Default | Purpose |
 |---|---|---|
+| `--engine` | `surya` | `surya` (transformer, high accuracy) or `tesseract` (lightweight) |
 | `--src` | `./input` | PDF source folder |
 | `--out` | `./output` | Markdown destination |
 | `--dpi` | 400 | Render DPI |
-| `--lang` | `eng` | Tesseract language (e.g. `eng+nld`) |
-| `--tessdata` | — | Override tessdata directory |
-| `--tesseract` | auto | Path to `tesseract.exe` |
+| `--lang` | `eng` | Tesseract language (Tesseract engine only) |
+| `--tessdata` | — | Override tessdata directory (Tesseract engine only) |
+| `--tesseract` | auto | Path to `tesseract.exe` (Tesseract engine only) |
 | `--force` | off | Re-OCR even if markdown exists |
 | `-v` | off | Verbose logging (per-page confidence) |
 
