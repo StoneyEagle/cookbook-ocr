@@ -198,10 +198,13 @@ def ensure_min_dpi(gray: np.ndarray, src_dpi: int, min_dpi: int) -> np.ndarray:
     return cv2.resize(gray, (int(w * scale), int(h * scale)), interpolation=cv2.INTER_CUBIC)
 
 
-def preprocess(bgr: np.ndarray, src_dpi: int) -> Image.Image:
+def preprocess(bgr: np.ndarray, src_dpi: int, aggressive: bool = False) -> Image.Image:
     """
     Pipeline tuned for old, yellowed cookbook pages:
-      grayscale → CLAHE (uneven lighting) → denoise → deskew → upscale → adaptive threshold.
+      grayscale → CLAHE (uneven lighting) → denoise → deskew → upscale → binarize.
+
+    ``aggressive``: use a tighter hard threshold that only keeps near-black ink.
+    Useful when illustrations or screened backgrounds bleed through text boxes.
     """
     gray = cv2.cvtColor(bgr, cv2.COLOR_BGR2GRAY)
     clahe = cv2.createCLAHE(clipLimit=2.0, tileGridSize=(8, 8))
@@ -209,9 +212,14 @@ def preprocess(bgr: np.ndarray, src_dpi: int) -> Image.Image:
     gray = cv2.fastNlMeansDenoising(gray, h=12, templateWindowSize=7, searchWindowSize=21)
     gray = deskew(gray)
     gray = ensure_min_dpi(gray, src_dpi, MIN_EFFECTIVE_DPI)
-    binarized = cv2.adaptiveThreshold(
-        gray, 255, cv2.ADAPTIVE_THRESH_GAUSSIAN_C, cv2.THRESH_BINARY, 31, 15
-    )
+    if aggressive:
+        # Hard threshold: only the darkest ink pixels survive. Washes out
+        # medium-gray illustration line-art while keeping pure-black text.
+        _, binarized = cv2.threshold(gray, 110, 255, cv2.THRESH_BINARY)
+    else:
+        binarized = cv2.adaptiveThreshold(
+            gray, 255, cv2.ADAPTIVE_THRESH_GAUSSIAN_C, cv2.THRESH_BINARY, 31, 15
+        )
     return Image.fromarray(binarized)
 
 
@@ -231,24 +239,28 @@ def detect_column_ranges(bgr: np.ndarray) -> list[tuple[int, int]]:
     bw = cv2.subtract(bw, horiz_lines)
 
     col_ink = bw.sum(axis=0) / 255.0
-    # Smooth to wash out word gaps.
     k = max(5, w // 200)
     smoothed = np.convolve(col_ink, np.ones(k) / k, mode="same")
     empty = smoothed < (h * 0.01)
+    # Columns where most of the height is inked are vertical decorative rules —
+    # treat them as gutters too (they separate page regions just like whitespace).
+    rule = smoothed > (h * 0.55)
+    boundary = empty | rule
 
-    nonempty = np.where(~empty)[0]
+    nonempty = np.where(~boundary)[0]
     if nonempty.size == 0:
         return [(0, w)]
     left_edge, right_edge = int(nonempty[0]), int(nonempty[-1]) + 1
 
-    # Find internal gutters (wide runs of empty columns, not touching edges).
-    min_gutter = max(20, int(w * 0.02))
+    # Find internal gutters (wide runs of boundary columns, not touching edges).
+    # Rules can be quite thin (3-5px), so allow shorter runs.
+    min_gutter = max(8, int(w * 0.005))
     gutters: list[tuple[int, int]] = []
     i = left_edge
     while i < right_edge:
-        if empty[i]:
+        if boundary[i]:
             j = i
-            while j < right_edge and empty[j]:
+            while j < right_edge and boundary[j]:
                 j += 1
             if j - i >= min_gutter:
                 gutters.append((i, j))
@@ -316,32 +328,41 @@ def best_ocr_layout_aware(
     bgr: np.ndarray, src_dpi: int, lang: str, extra_cfg: str
 ) -> tuple[str, float, str]:
     """
-    Detect columns and pick the higher-confidence of full-page vs per-column OCR.
+    Detect columns and pick the highest-confidence variant among:
+      - full-page (standard adaptive threshold)
+      - full-page (aggressive threshold — kills illustration bleed-through)
+      - per-column (when 2+ columns detected)
     Returns (text, conf, mode_label).
     """
+    variants: list[tuple[str, float, str]] = []
+
     full_img = preprocess(bgr, src_dpi)
     full_text, full_conf, full_psm = best_ocr(full_img, lang, extra_cfg)
+    variants.append((full_text, full_conf, f"full/psm{full_psm}"))
+
+    aggr_img = preprocess(bgr, src_dpi, aggressive=True)
+    aggr_text, aggr_conf, aggr_psm = best_ocr(aggr_img, lang, extra_cfg)
+    variants.append((aggr_text, aggr_conf, f"hard/psm{aggr_psm}"))
 
     columns = detect_column_ranges(bgr)
-    if len(columns) < 2:
-        return full_text, full_conf, f"full/psm{full_psm}"
+    log.debug("Detected %d column(s): %s", len(columns), columns)
+    if len(columns) >= 2:
+        col_psms = (6, 4)
+        col_texts: list[str] = []
+        col_confs: list[float] = []
+        for x0, x1 in columns:
+            col_img = preprocess(bgr[:, x0:x1], src_dpi)
+            text, conf, _ = _race_psms(col_img, lang, extra_cfg, col_psms)
+            col_texts.append(text)
+            col_confs.append(conf if conf > 0 else 0.0)
+        multi_conf = float(np.mean(col_confs)) if col_confs else 0.0
+        multi_text = "\n\n".join(t for t in col_texts if t.strip())
+        if multi_text.strip():
+            variants.append((multi_text, multi_conf, f"cols-{len(columns)}"))
 
-    # PSM 6 = uniform text block; PSM 4 = single column variable sizes.
-    col_psms = (6, 4)
-    col_texts: list[str] = []
-    col_confs: list[float] = []
-    for x0, x1 in columns:
-        col_img = preprocess(bgr[:, x0:x1], src_dpi)
-        text, conf, _ = _race_psms(col_img, lang, extra_cfg, col_psms)
-        col_texts.append(text)
-        col_confs.append(conf if conf > 0 else 0.0)
-
-    multi_conf = float(np.mean(col_confs)) if col_confs else 0.0
-    multi_text = "\n\n".join(t for t in col_texts if t.strip())
-
-    if multi_conf > full_conf + 0.5:
-        return multi_text, multi_conf, f"cols-{len(columns)}"
-    return full_text, full_conf, f"full/psm{full_psm}"
+    # Pick the variant with highest confidence; tie-break on character count.
+    variants.sort(key=lambda v: (v[1], len(v[0])), reverse=True)
+    return variants[0]
 
 
 # ---------- cleanup ----------
@@ -670,6 +691,11 @@ def main() -> int:
             )
         os.environ["TESSDATA_PREFIX"] = str(tessdata_abs)
         extra_cfg = f"--tessdata-dir {tessdata_abs}"
+        # Cooking-domain wordlist nudges Tesseract toward cookbook vocab
+        # (accented French terms, pasta shapes, chile varieties, etc.).
+        user_words = tessdata_abs / "cookbook-words.txt"
+        if user_words.exists() and " " not in str(user_words):
+            extra_cfg += f" --user-words {user_words}"
 
     check_tesseract()
 
