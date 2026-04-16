@@ -150,6 +150,30 @@ def correct_orientation(bgr: np.ndarray) -> np.ndarray:
     return bgr
 
 
+def remove_rulers(bgr: np.ndarray) -> np.ndarray:
+    """
+    Inpaint long horizontal/vertical ruler lines that confuse Tesseract's
+    layout analysis on pages with decorative column separators or margin rules.
+    """
+    gray = cv2.cvtColor(bgr, cv2.COLOR_BGR2GRAY)
+    _, bw = cv2.threshold(gray, 0, 255, cv2.THRESH_BINARY_INV | cv2.THRESH_OTSU)
+    h, w = gray.shape
+    # Require rulers to be quite long (≥ 12% of dimension) so we don't nuke glyphs.
+    h_len = max(40, w // 8)
+    v_len = max(40, h // 8)
+    horiz = cv2.morphologyEx(
+        bw, cv2.MORPH_OPEN, cv2.getStructuringElement(cv2.MORPH_RECT, (h_len, 1))
+    )
+    vert = cv2.morphologyEx(
+        bw, cv2.MORPH_OPEN, cv2.getStructuringElement(cv2.MORPH_RECT, (1, v_len))
+    )
+    rulers = cv2.bitwise_or(horiz, vert)
+    if rulers.sum() == 0:
+        return bgr
+    rulers = cv2.dilate(rulers, np.ones((3, 3), np.uint8), iterations=1)
+    return cv2.inpaint(bgr, rulers, 3, cv2.INPAINT_TELEA)
+
+
 def deskew(gray: np.ndarray) -> np.ndarray:
     """Small-angle skew correction via minAreaRect of text pixels."""
     inv = cv2.bitwise_not(gray)
@@ -315,7 +339,7 @@ def best_ocr_layout_aware(
     multi_conf = float(np.mean(col_confs)) if col_confs else 0.0
     multi_text = "\n\n".join(t for t in col_texts if t.strip())
 
-    if multi_conf > full_conf + 1.5:  # bias toward full-page unless clearly better
+    if multi_conf > full_conf + 0.5:
         return multi_text, multi_conf, f"cols-{len(columns)}"
     return full_text, full_conf, f"full/psm{full_psm}"
 
@@ -351,6 +375,57 @@ def _looks_like_word(token: str) -> bool:
         return False
     # wordfreq zipf: 7=ultra-common, 3=moderate, 2=rare but real, 0=unknown.
     return zipf_frequency(t, "en") >= 2.0
+
+
+_SINGLE_CHAR_WORDS = {"a", "i", "o", "&", "+"}
+
+
+def _strip_line_suffix_junk(line: str) -> str:
+    """Drop trailing margin-rule artifacts like 'day or |' or '--H' at line end."""
+    s = line.rstrip()
+    s = re.sub(r"\s+[|:]+\s*$", "", s)
+    tokens = s.split()
+    drop = 0
+    for t in reversed(tokens[-3:]):
+        bare = t.strip(".,!?;:|/\\<>*'\"()[]{}-_")
+        if not bare:
+            drop += 1
+            continue
+        if bare.lower() in _SINGLE_CHAR_WORDS:
+            break
+        if _looks_like_word(bare) or any(ch.isdigit() for ch in bare):
+            break
+        if len(bare) <= 2:
+            drop += 1
+            continue
+        break
+    if drop:
+        return " ".join(tokens[: len(tokens) - drop])
+    return s
+
+
+def _strip_line_prefix_junk(line: str) -> str:
+    """Drop leading single-char or pipe-like tokens that came from margin rules."""
+    s = line.lstrip()
+    s = re.sub(r"^[|:]+\s+", "", s)
+    tokens = s.split()
+    drop = 0
+    for t in tokens[:3]:
+        bare = t.strip(".,!?;:|/\\<>*'\"()[]{}-")
+        if not bare:
+            drop += 1
+            continue
+        if bare.lower() in _SINGLE_CHAR_WORDS:
+            break
+        if _looks_like_word(bare) or any(ch.isdigit() for ch in bare):
+            break
+        if len(bare) <= 2:  # "Co", "Ho" and similar short non-words
+            drop += 1
+            continue
+        break
+    if drop:
+        return " ".join(tokens[drop:])
+    return s
 
 
 def _is_garbage_line(line: str) -> bool:
@@ -417,7 +492,15 @@ def clean_text(raw: str) -> str:
             merged.append(ln)
             i += 1
 
-    filtered = [ln for ln in merged if not _is_garbage_line(ln)]
+    # Strip leading AND trailing margin debris from each line
+    # ("| Add to the pan:" → "Add to the pan:", "day or |" → "day or").
+    cleaned_lines: list[str] = []
+    for ln in merged:
+        stripped = _strip_line_prefix_junk(ln)
+        stripped = _strip_line_suffix_junk(stripped)
+        cleaned_lines.append(stripped)
+
+    filtered = [ln for ln in cleaned_lines if not _is_garbage_line(ln)]
     text = "\n".join(filtered)
 
     for pattern, repl in FRACTION_FIXUPS:
