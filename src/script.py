@@ -97,6 +97,14 @@ FRACTION_FIXUPS: list[tuple[re.Pattern, str]] = [
     (re.compile(rf"(\d)\s+1/2(?=\s+{_UNIT})", re.I), r"\1½"),
     (re.compile(rf"(\d)\s+1/4(?=\s+{_UNIT})", re.I), r"\1¼"),
     (re.compile(rf"(\d)\s+3/4(?=\s+{_UNIT})", re.I), r"\1¾"),
+    # Mangled ½ variants with leading quote: "'/2 cup", "'/4 cup".
+    (re.compile(rf"'\s*/\s*2(?=\s+{_UNIT})", re.I), "½"),
+    (re.compile(rf"'\s*/\s*4(?=\s+{_UNIT})", re.I), "¼"),
+    # "Y=}" / "Y=}" with any trailing junk before unit → ¼ or ¼-½ range.
+    (re.compile(rf"Y\s*=\s*\}}(?=\s*[-–]\s*[½1/]?\s*{_UNIT})", re.I), "¼"),
+    (re.compile(rf"(?<!\w)Y[=\.]\s*(?=\s+{_UNIT})", re.I), "¼"),
+    # "Y." / "Y," standalone fraction-like → ¼.
+    (re.compile(rf"(?<!\w)Y[.,](?=\s+{_UNIT})", re.I), "¼"),
 ]
 
 log = logging.getLogger("cookbook-ocr")
@@ -417,14 +425,84 @@ def clean_text(raw: str) -> str:
 
     text = re.sub(r"[ \t]+", " ", text)
     text = re.sub(r"\n{3,}", "\n\n", text)
-    # Preserve source line breaks in rendered markdown. Single "\n" renders as
-    # a space, which destroys ingredient lists — append two trailing spaces to
-    # every non-empty line so markdown treats them as hard line breaks.
+
+    raw_lines = text.splitlines()
     out_lines: list[str] = []
-    for ln in text.splitlines():
+    for i, ln in enumerate(raw_lines):
         stripped = ln.rstrip()
-        out_lines.append(stripped + "  " if stripped else "")
+        if not stripped:
+            out_lines.append("")
+            continue
+        prev = raw_lines[i - 1].strip() if i > 0 else ""
+        nxt = raw_lines[i + 1].strip() if i + 1 < len(raw_lines) else ""
+        if _is_likely_heading(stripped, prev, nxt):
+            # Headings stand alone — no trailing hard break, blank line before.
+            if out_lines and out_lines[-1] != "":
+                out_lines.append("")
+            out_lines.append(f"## {stripped}")
+        else:
+            out_lines.append(stripped + "  ")
     return "\n".join(out_lines).strip()
+
+
+_DATA_LABEL = re.compile(
+    r"^\s*\d+\s*(?:[°%]|mL|ml|cm|mm|km|cup|tsp|tbsp|oz|lb|g\b|kg)",
+    re.I,
+)
+
+
+def _looks_like_prose(line: str) -> bool:
+    """Does the line read as a continuation of natural text (not data/comic)?"""
+    if not line:
+        return False
+    if _DATA_LABEL.match(line):
+        return False
+    if "|" in line:
+        return False
+    # Typical prose: starts with a letter, contains lowercase, at least some length.
+    if not line[:1].isalpha():
+        return False
+    lowercase_count = sum(1 for ch in line if ch.islower())
+    return lowercase_count >= 3
+
+
+def _is_likely_heading(line: str, prev: str, nxt: str) -> bool:
+    """Detect recipe titles / section headers isolated between blank lines."""
+    if len(line) > 80 or len(line) < 6:
+        return False
+    if line[-1] in ",;.!?":
+        return False
+    # Must have a blank line above. nxt may be blank OR prose-like — but if
+    # it's a data row or comic fragment, this line is probably a fragment too.
+    if prev:
+        return False
+    if nxt and not _looks_like_prose(nxt):
+        return False
+    if _DATA_LABEL.match(line):
+        return False
+    # Lines starting with a digit are almost always list items or data rows,
+    # not recipe titles. Pipes = comic panels / table separators.
+    if line[:1].isdigit() or "|" in line:
+        return False
+    tokens = line.split()
+    if len(tokens) < 2:
+        return False
+    # Require a lowercase letter somewhere — Title Case, not all caps.
+    # All-caps standalone lines in cookbooks are almost always decorative or
+    # part of data layouts, never prose-style chapter headings.
+    if not any(ch.islower() for ch in line):
+        return False
+    content = [t for t in tokens if len(t.strip(".,!?;:'\"()[]{}")) > 3]
+    if not content:
+        return False
+    if not all(t[:1].isupper() or not t[:1].isalpha() for t in content):
+        return False
+    # Need at least two recognizable English words — rejects Tesseract salad
+    # that happens to pass Title Case shape.
+    real = [t for t in tokens if _looks_like_word(t)]
+    if len(real) < 2:
+        return False
+    return True
 
 
 # ---------- driver ----------
