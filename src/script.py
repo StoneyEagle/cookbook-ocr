@@ -672,9 +672,10 @@ def ocr_pdf(
             if engine_name == "surya" and surya_engine is not None:
                 from surya_engine import assemble_markdown
                 lines, conf = surya_engine.ocr_page(bgr)
-                raw = assemble_markdown(lines, page_width=bgr.shape[1])
+                # assemble_markdown emits finished markdown (headings, bullets,
+                # joined prose); clean_text would damage the bullet markers.
+                cleaned = assemble_markdown(lines, page_width=bgr.shape[1])
                 mode = f"surya/{len(lines)}lines"
-                cleaned = clean_text(raw)
             else:
                 text, conf, mode = best_ocr_layout_aware(bgr, dpi, lang, extra_cfg)
                 cleaned = clean_text(text)
