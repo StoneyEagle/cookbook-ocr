@@ -333,11 +333,19 @@ def _format_mixed(lines: list[str]) -> str:
             i += 1
             continue
 
+        # Pre-bulleted line (publisher tip bullet "•" normalized to "- ").
+        pre_bulleted = line.startswith("- ")
         is_quantity = _starts_with_quantity(line) or _looks_like_seasoning_item(line)
 
         # Continuation of an existing list item?
-        if list_items and not is_quantity and _is_item_continuation(list_items[-1], line):
+        if list_items and not is_quantity and not pre_bulleted and _is_item_continuation(list_items[-1], line):
             list_items[-1] = _join_with_hyphen(list_items[-1], line)
+            i += 1
+            continue
+
+        if pre_bulleted:
+            flush_paragraph()
+            list_items.append(line[2:].strip())
             i += 1
             continue
 
